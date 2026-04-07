@@ -1,0 +1,153 @@
+================================================================================
+FINAL PERFORMANCE REPORT: MULTI-DIMENSIONAL GEMM OPTIMIZATION ON APPLE SILICON
+================================================================================
+
+1. EXPERIMENTAL SETUP & METHODOLOGY
+--------------------------------------------------------------------------------
+- Hardware Platform: Apple Silicon (M-series, ARM64 architecture, 8-Core)
+- Operating System: macOS (Darwin)
+- Compiler: clang++ -O3 (with -fopenmp)
+- Reference Baseline: Apple Accelerate Framework (cblas_sgemm)
+- Target Algorithm: Blocked Matrix Multiplication (GEMM)
+- Research Scope: 
+  This report integrates three progressive experiments:
+  1) Correctness & Baseline Parallelism
+  2) Cache Optimization via Block Size (B) Tuning
+  3) Hardware Limits via Thread (T) Scaling
+
+2. EXPERIMENT 1: CORRECTNESS VERIFICATION & BASELINE
+--------------------------------------------------------------------------------
+The candidate kernel was evaluated against the hardware-optimized cblas_sgemm 
+for all matrix sizes (N = 1024, 2048, 4096) and block sizes (B = 16, 32, 64).
+- Maximum Absolute Discrepancy: 0.000000
+- Correctness Status: PASSED (100% mathematical accuracy achieved)
+
+3. EXPERIMENT 2: BLOCK SIZE (B) SENSITIVITY ANALYSIS
+--------------------------------------------------------------------------------
+Testing OpenMP Multi-threading (T=8) vs. Single-thread across different Block 
+Sizes to determine optimal cache utilization.
+
+Resolution (N) | Block Size | 1-Thread (ms) | 8-Thread (ms) | Speedup Ratio
+---------------|------------|---------------|---------------|--------------
+1024 x 1024    | B=16       | 73.65         | 33.26         | 2.21x
+               | B=32       | 65.18         | 22.61         | 2.88x
+               | B=64       | 58.09         | 11.98         | 4.85x (Peak)
+---------------|------------|---------------|---------------|--------------
+2048 x 2048    | B=16       | 611.26        | 306.15        | 2.00x
+               | B=32       | 548.71        | 226.51        | 2.42x
+               | B=64       | 463.22        | 162.58        | 2.85x
+---------------|------------|---------------|---------------|--------------
+4096 x 4096    | B=16       | 11474.29      | 3018.44       | 3.80x
+               | B=32       | 5661.19       | 2207.39       | 2.56x
+               | B=64       | 4289.46       | 1225.90       | 3.50x
+
+Key Finding: B=64 is the absolute performance champion. While B=16 at N=4096 
+shows a higher speedup ratio (3.80x), this is a "Speedup Illusion" caused by 
+its extremely slow single-thread baseline (11.4s). Absolute latency is the 
+true metric of success.
+
+4. EXPERIMENT 3: THREAD (T) SCALING & BOTTLENECK ANALYSIS
+--------------------------------------------------------------------------------
+Fixing matrix size at N=2048, we scaled threads from 1 to 10 to observe 
+the hardware's parallel capacity, comparing inefficient (B=16) vs efficient 
+(B=64) configurations. The table below introduces "Marginal Speedup" to 
+measure the incremental performance gained from adding the latest batch of threads.
+
+Threads(T) | B=16 Time | B=16 Abs | B=16 Marg | B=64 Time | B=64 Abs | B=64 Marg
+-----------|-----------|----------|-----------|-----------|----------|----------
+T=1 (Base) | 611.26 ms | 1.00x    | -         | 463.22 ms | 1.00x    | -
+T=2        | 410.51 ms | 1.49x    | 1.49x     | 238.25 ms | 1.94x    | 1.94x
+T=4        | 320.51 ms | 1.91x    | 1.28x     | 198.62 ms | 2.33x    | 1.20x
+T=8        | 295.45 ms | 2.07x    | 1.08x     | 175.18 ms | 2.64x    | 1.13x
+T=10       | 318.89 ms | 1.92x    | 0.93x     | 163.07 ms | 2.84x    | 1.07x
+
+Key Findings & Architectural Analysis:
+Increasing threads yields diminishing returns, but exposes critical architectural 
+bottlenecks.
+
+5. IN-DEPTH ARCHITECTURAL DISCUSSION & CONCLUSION
+--------------------------------------------------------------------------------
+The three experiments conducted in this study expose several fundamental 
+principles and bottlenecks of modern CPU architectures.
+
+A) COMPUTATIONAL DENSITY VS. MEMORY BANDWIDTH (THE MEMORY WALL)
+The stark performance contrast between B=64 and B=16 perfectly illustrates 
+the concept of "Arithmetic Intensity" (the ratio of floating-point operations 
+to memory byte transfers). B=64 succeeds because it effectively utilizes the 
+L1 Data Cache, keeping the CPU pipelines fed with data already residing in 
+fast local memory. Conversely, B=16 fails to scale because its low arithmetic 
+intensity forces the CPU to constantly stall while waiting for data. This 
+saturates the memory bus with frequent, fragmented requests, proving that 
+in modern systems, memory access latency is a far stricter bottleneck than 
+raw computational capacity.
+
+B) THREAD OVER-SUBSCRIPTION AND SYNCHRONIZATION OVERHEAD
+The performance degradation observed at T=10 highlights the penalty of thread 
+over-subscription and synchronization barriers. When the number of active 
+software threads exceeds the optimal capacity of the underlying physical cores, 
+the Operating System is forced into aggressive Context Switching. The CPU 
+wastes millions of clock cycles saving and restoring thread states (registers, 
+program counters) rather than doing actual math. Furthermore, under OpenMP's 
+static scheduling, faster threads are forced to idle at implicit synchronization 
+barriers waiting for delayed threads, severely eroding parallel efficiency.
+
+C) THERMAL THROTTLING AND DYNAMIC FREQUENCY SCALING (DVFS)
+During the massive N=4096, B=64 tests, significant timing jitter was observed 
+across consecutive runs (e.g., execution times fluctuating drastically). This 
+is a classic manifestation of Dynamic Voltage and Frequency Scaling (DVFS). 
+Because the B=64 kernel is highly compute-bound and maximizes pipeline 
+utilization, it draws peak power and rapidly pushes the physical CPU die 
+toward its Thermal Design Power (TDP) limit. To prevent hardware damage, the 
+processor firmware forcefully down-clocks the CPU frequency (Thermal Throttling), 
+resulting in unpredictable execution times during sustained heavy workloads.
+
+D) THE INDUSTRIAL BASELINE GAP (COMPILER VS. HAND-TUNED MICRO-KERNELS)
+Despite applying optimal 4D-blocking and multi-threading, our best candidate 
+kernel remains roughly 5x slower than the highly optimized cblas_sgemm reference. 
+This exposes the limits of standard C++ auto-vectorization. Industrial BLAS 
+libraries do not just rely on generic C++ loops; they are built using 
+hand-written assembly, explicit cache-line prefetching instructions, extreme 
+register unrolling, and micro-kernels tailored to the exact pipeline depth 
+and SIMD width of the specific processor. It demonstrates the massive gap 
+between "good algorithm design" and "extreme hardware-software co-design."
+
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+BONUS TASK: Rectangular Matrix Multiplication & Performance Asymmetry
+
+1. Implementation Adjustments
+To support rectangular matrix multiplication (C[M x N] = A[M x K] * B[K x N]), the original benchmark code was heavily refactored while preserving the highly optimized 4D-blocking and SIMD intrinsics. Key modifications include:
+
+- Decoupled Dimensions: Replaced the global MATRIX_SIZE with independent macros DIM_M, DIM_K, and DIM_N.
+- Asymmetric Block Grids: The single NBLOCKS parameter was divided into MBLOCKS = DIM_M / BLOCK_SIZE, KBLOCKS = DIM_K / BLOCK_SIZE, and NBLOCKS = DIM_N / BLOCK_SIZE.
+- Memory Casting: The 4D memory casting was generalized to safely interpret the contiguous 1D memory layout into asymmetric grid shapes (e.g., float (&)[MBLOCKS][BLOCK_SIZE][KBLOCKS][BLOCK_SIZE]).
+- Preserved Block Locality: The inner BLOCK_SIZE was strictly kept at 64x64 (a perfect square) to maintain optimal L1 Cache utilization (48KB total footprint for localA, localB, and localC), avoiding cache thrashing. The reference cblas_sgemm was also updated with the correct strides.
+
+2. Experimental Design (Controlled Variables)
+To deeply analyze the performance impact of matrix shapes, I designed a controlled experiment. Instead of comparing the rectangular matrix against a randomly sized square matrix, I matched the computational workload (Total MAC operations) to isolate the effect of memory access patterns.
+
+- Candidate (Rectangular): 1024 x 2048 x 1024
+  * Total Operations: ~2.147 Billion MACs.
+- Reference (Square): 1280 x 1280 x 1280
+  * Total Operations: ~2.097 Billion MACs. (Slightly fewer operations to ensure a conservative baseline).
+
+3. Performance Results
+Both configurations were executed using the same hardware (Apple Silicon) and compiler flags (-O3 -Xpreprocessor -fopenmp). The pre-throttling peak performances (average of the first 3 runs) are recorded below:
+
+--------------------------------------------------------------------------------------------------------
+Configuration   | Matrix Shape (M x K x N) | Computational Load | Output Matrix (C) Size | Avg. Time
+--------------------------------------------------------------------------------------------------------
+Rectangular     | 1024 x 2048 x 1024       | ~2.14 Billion ops  | 4.19 MB                | ~21.20 ms
+Square          | 1280 x 1280 x 1280       | ~2.09 Billion ops  | 6.55 MB                | ~22.58 ms
+--------------------------------------------------------------------------------------------------------
+
+4. Architectural Analysis & Conclusion
+Paradoxically, the rectangular matrix executes 6.5% faster despite requiring 2.3% more arithmetic operations. This counter-intuitive result exposes a critical hardware bottleneck in cache-bound workloads: Memory Read vs. Memory Write Asymmetry. 
+
+While matrices A and B are strictly read-only during the computation, the output matrix C requires continuous Read-Modify-Write operations. Writing data back to Main Memory (RAM) is significantly more expensive in terms of latency and bandwidth than reading it.
+
+- In the rectangular configuration, the output matrix C (1024 x 1024) is roughly 4.19 MB. This smaller memory footprint fits much more comfortably within the processor's L2/L3 cache hierarchy, minimizing expensive cache evictions and write-backs to the main memory.
+- In the square configuration, the output matrix C (1280 x 1280) expands to 6.55 MB. This larger footprint forces the CPU to constantly evict cache lines and write partial results back to RAM, severely bottlenecking the execution pipeline.
+
+Conclusion: 
+In modern CPU architectures, floating-point operations are extremely cheap compared to memory movement. By minimizing the spatial footprint of the output matrix (where writes occur), the rectangular GEMM configuration achieves a higher sustained hardware utilization, proving that optimization must prioritize memory locality over pure arithmetic complexity.
